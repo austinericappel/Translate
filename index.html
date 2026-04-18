@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a3d2a" />
+  <title>Poker Chips</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <section id="welcome" class="screen">
+      <div class="card">
+        <h1>♠ Poker Chips ♥</h1>
+        <p class="tagline">Play poker with real cards. Track chips here.</p>
+
+        <div class="block">
+          <label>Your name</label>
+          <input id="playerName" type="text" maxlength="20" autocomplete="off" placeholder="Alex" />
+        </div>
+
+        <details class="block" open>
+          <summary>Create a lobby</summary>
+          <label>Starting stack</label>
+          <input id="startStack" type="number" value="1000" min="1" />
+          <label>Small blind</label>
+          <input id="smallBlind" type="number" value="5" min="0" />
+          <label>Big blind</label>
+          <input id="bigBlind" type="number" value="10" min="0" />
+          <button id="createBtn" class="primary">Create Lobby</button>
+        </details>
+
+        <details class="block">
+          <summary>Join a lobby</summary>
+          <label>Lobby code</label>
+          <input id="joinCode" type="text" maxlength="8" autocapitalize="characters" autocomplete="off" placeholder="ABC12" />
+          <button id="joinBtn" class="primary">Join</button>
+        </details>
+
+        <p id="welcomeStatus" class="status"></p>
+      </div>
+    </section>
+
+    <section id="game" class="screen hidden">
+      <header id="topbar">
+        <div class="lobby-id">
+          <span class="label">Lobby</span>
+          <strong id="lobbyCode"></strong>
+          <button id="copyBtn" title="Copy invite link">Copy link</button>
+        </div>
+        <div class="pot">
+          <span class="label">Pot</span>
+          <strong id="potAmount">0</strong>
+        </div>
+      </header>
+
+      <main>
+        <div id="status" class="status"></div>
+
+        <section id="players" class="players"></section>
+
+        <section id="youControls" class="you-controls hidden">
+          <div id="betSlider" class="bet-slider hidden">
+            <input id="betAmount" type="range" min="0" max="100" value="0" />
+            <input id="betAmountText" type="number" min="0" value="0" />
+          </div>
+          <div id="actionButtons" class="actions"></div>
+        </section>
+
+        <section id="hostControls" class="host-controls hidden">
+          <h3>Host controls</h3>
+          <div class="host-buttons">
+            <button id="startHandBtn">Start Hand (post blinds)</button>
+            <button id="nextRoundBtn">End betting round</button>
+            <button id="resetHandBtn" class="subtle">Cancel hand</button>
+          </div>
+          <div id="winnerPanel" class="winner-panel hidden">
+            <p>Pick pot winner(s):</p>
+            <div id="winnerButtons" class="winner-buttons"></div>
+            <button id="splitBtn" class="subtle">Split pot evenly among selected</button>
+          </div>
+          <details class="block">
+            <summary>Blinds / settings</summary>
+            <label>Small blind</label>
+            <input id="sbInput" type="number" min="0" />
+            <label>Big blind</label>
+            <input id="bbInput" type="number" min="0" />
+            <button id="saveBlindsBtn" class="subtle">Save blinds</button>
+          </details>
+        </section>
+
+        <section id="log" class="log"></section>
+
+        <footer class="foot">
+          <button id="leaveBtn" class="subtle">Leave lobby</button>
+        </footer>
+      </main>
+    </section>
+  </div>
+
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
