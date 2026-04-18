@@ -216,20 +216,22 @@ function sendAction(kind, amount) {
   }
 }
 
-// ---------- Game model ----------
+// ---------- Game model (Texas Hold'em: preflop / flop / turn / river) ----------
+const STREETS = ["preflop", "flop", "turn", "river"];
 function newGame({ startStack, sb, bb }) {
   return {
     hostId: null,
     startStack, sb, bb,
-    order: [],               // seat order of player ids
-    players: {},             // id -> { id, name, stack, bet, folded, allIn, disconnected }
-    dealerIdx: 0,            // index into order (of dealer)
-    turn: null,              // id whose action it is
+    order: [],
+    players: {},
+    dealerIdx: 0,
+    turn: null,
     pot: 0,
-    currentBet: 0,           // highest bet in current round
-    minRaise: 0,             // min legal raise delta
-    lastAggressor: null,     // id of last raiser (to stop betting round)
-    round: "idle",           // "idle" | "betting" | "decide"
+    currentBet: 0,
+    minRaise: 0,
+    lastAggressor: null,
+    street: null,            // "preflop" | "flop" | "turn" | "river" | null
+    round: "idle",           // "idle" | "betting" | "wait_deal" | "decide"
     log: [],
   };
 }
@@ -252,6 +254,7 @@ function startHand(g) {
     p.bet = 0;
     p.folded = p.stack <= 0;
     p.allIn = false;
+    p._acted = false;
   }
   // Advance dealer
   g.dealerIdx = nextSeatIdx(g, g.dealerIdx);
@@ -265,23 +268,55 @@ function startHand(g) {
     sbIdx = nextSeatIdx(g, g.dealerIdx);
     bbIdx = nextSeatIdx(g, sbIdx);
   }
-  postBlind(g, g.order[sbIdx], g.sb);
-  postBlind(g, g.order[bbIdx], g.bb);
-  g.pot = g.sb + g.bb;
+  const sbPaid = postBlind(g, g.order[sbIdx], g.sb);
+  const bbPaid = postBlind(g, g.order[bbIdx], g.bb);
+  g.pot = sbPaid + bbPaid;
   g.currentBet = g.bb;
   g.minRaise = g.bb;
-  g.lastAggressor = g.order[bbIdx]; // initial live "last aggressor" = BB
+  g.lastAggressor = g.order[bbIdx]; // preflop closes when action returns to BB and is matched
   const firstToAct = seatedIdxs.length === 2 ? g.order[g.dealerIdx] : g.order[nextSeatIdx(g, bbIdx)];
   g.turn = firstToAct;
+  g.street = "preflop";
   g.round = "betting";
-  addLog(`New hand. Dealer: ${g.players[g.order[g.dealerIdx]].name}. SB ${g.sb} / BB ${g.bb}.`);
+  addLog(`New hand #${"" /* simple */}. Dealer: ${g.players[g.order[g.dealerIdx]].name}. Blinds ${g.sb}/${g.bb}. Deal hole cards.`);
   return true;
 }
+
+function dealNextStreet(g) {
+  if (g.round !== "wait_deal") return false;
+  const nextIdx = STREETS.indexOf(g.street) + 1;
+  if (nextIdx >= STREETS.length) return false;
+  g.street = STREETS[nextIdx];
+  startBettingRound(g);
+  addLog(`Dealt the ${g.street}.`);
+  return true;
+}
+
+function startBettingRound(g) {
+  // Reset per-street betting state
+  for (const id of g.order) { g.players[id].bet = 0; g.players[id]._acted = false; }
+  g.currentBet = 0;
+  g.minRaise = g.bb;
+  g.lastAggressor = null;
+  // First to act post-flop: first non-folded, non-all-in player left of dealer
+  const firstIdx = nextSeatIdx(g, g.dealerIdx);
+  const firstId = g.order[firstIdx];
+  // If everyone left can't act (all-in), skip straight to next street/decide
+  const liveCanAct = g.order.filter(i => !g.players[i].folded && !g.players[i].allIn);
+  if (liveCanAct.length < 2) {
+    if (g.street === "river") { g.round = "decide"; g.turn = null; }
+    else { g.round = "wait_deal"; g.turn = null; }
+    return;
+  }
+  g.turn = firstId;
+  g.round = "betting";
+}
 function postBlind(g, id, amt) {
-  const p = g.players[id]; if (!p) return;
+  const p = g.players[id]; if (!p) return 0;
   const pay = Math.min(amt, p.stack);
   p.stack -= pay; p.bet = pay;
   if (p.stack === 0) p.allIn = true;
+  return pay;
 }
 function nextSeatIdx(g, fromIdx) {
   const n = g.order.length;
@@ -337,33 +372,51 @@ function applyAction(g, id, kind, amount) {
     return;
   }
 
+  // Track that this player has acted this street (for round-close detection)
+  g.players[id]._acted = true;
+
   // Advance turn
   const idx = g.order.indexOf(id);
   const nextIdx = nextSeatIdx(g, idx);
   const nextId = g.order[nextIdx];
 
-  // Betting round closes when action returns to last aggressor and all active players
-  // have matched currentBet, OR everyone remaining is all-in.
   const liveCanAct = g.order.filter(i => !g.players[i].folded && !g.players[i].allIn);
   const allMatched = liveCanAct.every(i => g.players[i].bet === g.currentBet);
-  const returnsToAggressor = nextId === g.lastAggressor;
+  const allActed = liveCanAct.every(i => g.players[i]._acted);
 
+  // No one left who can act → skip remaining streets, host awards
   if (liveCanAct.length <= 1 && active.length >= 2) {
-    // No more decisions possible → go to decide
-    g.round = "decide";
-    g.turn = null;
-    addLog("All-in / no further action. Host, resolve the pot.");
+    addLog("No further action possible. Reveal remaining cards then award.");
+    closeStreet(g, /* skipToShowdown */ true);
     return;
   }
-  if (returnsToAggressor && allMatched) {
-    // Round complete. This app plays a single betting round per "hand" — host awards pot at showdown.
-    g.round = "decide";
-    g.turn = null;
-    addLog("Betting round complete. Host, award the pot.");
+
+  // Round closes when: action returns to last aggressor (preflop: BB) and all matched,
+  // OR (no aggressor yet — postflop) everyone live has acted and all matched.
+  const returnsToAggressor = g.lastAggressor && nextId === g.lastAggressor;
+  const closes = (returnsToAggressor && allMatched) || (g.lastAggressor === null && allActed && allMatched);
+
+  if (closes) {
+    closeStreet(g, false);
     return;
   }
   g.turn = nextId;
 }
+
+function closeStreet(g, skipToShowdown) {
+  // Move bets into pot already happened on each action; just clear per-street markers
+  for (const id of g.order) { g.players[id]._acted = false; }
+  if (skipToShowdown || g.street === "river") {
+    g.round = "decide";
+    g.turn = null;
+    addLog(g.street === "river" ? "River betting complete. Showdown — host awards pot." : "Reveal remaining cards. Host awards pot.");
+    return;
+  }
+  g.round = "wait_deal";
+  g.turn = null;
+  addLog(`${cap(g.street)} betting complete. Host: deal the ${STREETS[STREETS.indexOf(g.street)+1]}.`);
+}
+function cap(s){ return s ? s[0].toUpperCase()+s.slice(1) : s; }
 
 function awardPot(g, winnerIds) {
   if (g.round !== "decide" && g.round !== "betting") return;
@@ -395,6 +448,7 @@ function viewFromGame(g) {
     pot: g.pot,
     currentBet: g.currentBet,
     minRaise: g.minRaise,
+    street: g.street,
     round: g.round,
   };
 }
@@ -415,9 +469,13 @@ function enterGame() {
     $("hostControls").classList.remove("hidden");
     $("startHandBtn").onclick = () => { if (startHand(S.game)) broadcastState(); };
     $("nextRoundBtn").onclick = () => {
-      if (S.game.round === "betting") {
-        // Host forces round close (e.g., everyone checked around)
-        S.game.round = "decide"; S.game.turn = null; addLog("Host ended the betting round.");
+      // Host: deal next street (flop/turn/river) once betting closed,
+      // or jump to showdown after river.
+      if (S.game.round === "wait_deal") {
+        if (dealNextStreet(S.game)) broadcastState();
+      } else if (S.game.round === "betting") {
+        // Force-close current betting round
+        closeStreet(S.game, false);
         broadcastState();
       }
     };
@@ -449,6 +507,25 @@ function renderAll() {
   const v = S.view;
   $("potAmount").textContent = v.pot;
   $("lobbyCode").textContent = displayCode(S.lobbyCode);
+
+  // Update host action button labels based on round/street
+  if (S.role === "host") {
+    const startBtn = $("startHandBtn"), nextBtn = $("nextRoundBtn");
+    if (v.round === "idle") {
+      startBtn.textContent = "Deal new hand"; startBtn.disabled = false;
+      nextBtn.textContent = "—"; nextBtn.disabled = true;
+    } else if (v.round === "betting") {
+      startBtn.textContent = "Deal new hand"; startBtn.disabled = true;
+      nextBtn.textContent = "Force end betting"; nextBtn.disabled = false;
+    } else if (v.round === "wait_deal") {
+      const next = STREETS[STREETS.indexOf(v.street) + 1];
+      startBtn.textContent = "Deal new hand"; startBtn.disabled = true;
+      nextBtn.textContent = "Deal " + next; nextBtn.disabled = false;
+    } else if (v.round === "decide") {
+      startBtn.textContent = "Deal new hand"; startBtn.disabled = true;
+      nextBtn.textContent = "—"; nextBtn.disabled = true;
+    }
+  }
 
   // Players
   const pe = $("players");
@@ -540,10 +617,14 @@ function renderAll() {
   }
 
   // Status line
-  if (v.round === "idle") setStatus("Waiting for host to start the hand.");
+  if (v.round === "idle") setStatus("Waiting for host to deal a new hand.");
+  else if (v.round === "wait_deal") {
+    const next = STREETS[STREETS.indexOf(v.street) + 1];
+    setStatus(`${cap(v.street)} betting done. Host: deal the ${next}.`);
+  }
   else if (v.round === "decide") setStatus("Showdown — host awards the pot.");
-  else if (myTurn) setStatus("Your move.");
-  else if (v.turn) setStatus(`${v.players[v.turn].name}'s turn.`);
+  else if (myTurn) setStatus(`${cap(v.street)} — your move.`);
+  else if (v.turn) setStatus(`${cap(v.street)} — ${v.players[v.turn].name}'s turn.`);
   else setStatus("");
 }
 
