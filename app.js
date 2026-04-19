@@ -1,23 +1,46 @@
-// Poker Chips - PeerJS-based lobby. Host is authoritative.
+// Poker Chips - Firebase Realtime Database. Host is authoritative.
 // Real cards at the table; this app tracks stacks, bets, turn order, dealer,
 // and lets the host award pots.
 
 const $ = (id) => document.getElementById(id);
 const LOG_MAX = 40;
 
+// ---------- Firebase Config ----------
+// Get from: Firebase Console > Project Settings > Your apps > Web app
+const firebaseConfig = {
+  apiKey: "AIzaSyD0S5jCc8PapIdim6NqNPvp-GztxtENr-c",
+  authDomain: "poker-tracker-feab3.firebaseapp.com",
+  databaseURL: "https://poker-tracker-feab3-default-rtdb.firebaseio.com",
+  projectId: "poker-tracker-feab3",
+  storageBucket: "poker-tracker-feab3.firebasestorage.app",
+  messagingSenderId: "799851051459",
+  appId: "1:799851051459:web:4fb725cd3b7d990f446576",
+};
+
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+
 // ---------- State ----------
 const S = {
   role: null,          // "host" | "client"
-  peer: null,          // PeerJS instance
-  myId: null,          // my peer id
+  myId: null,          // unique player id (random, per tab)
   myName: "",
-  lobbyCode: "",       // for host: myId; for client: host's id
-  hostConn: null,      // client -> host DataConnection
-  clientConns: {},     // host: { peerId: DataConnection }
-  game: null,          // authoritative state (host only); clients get snapshots
-  view: null,          // latest view for clients
+  lobbyCode: "",       // 5-char code
+  game: null,          // authoritative state (host only)
+  view: null,          // latest view for rendering
   log: [],
+  cleanup: [],         // tear-down functions
 };
+
+// Persistent player ID per browser tab
+function getPlayerId() {
+  let id = sessionStorage.getItem("pokerPlayerId");
+  if (!id) {
+    id = "P" + rid(8);
+    sessionStorage.setItem("pokerPlayerId", id);
+  }
+  return id;
+}
 
 // ---------- Utility ----------
 function setStatus(msg, err = false) {
@@ -53,17 +76,23 @@ function rid(n = 5) {
   return s;
 }
 
-// ---------- PeerJS bootstrap ----------
-function initPeer(id) {
-  return new Promise((resolve, reject) => {
-    const peer = id ? new Peer(id) : new Peer();
-    let done = false;
-    peer.on("open", (pid) => { if (!done) { done = true; resolve(peer); } });
-    peer.on("error", (err) => {
-      if (!done) { done = true; reject(err); }
-      else console.warn("PeerJS error:", err.type, err.message);
-    });
+// ---------- Firebase Helpers ----------
+function lobbyRef() { return db.ref("lobbies/" + S.lobbyCode); }
+
+function broadcastState() {
+  const view = viewFromGame(S.game);
+  S.view = view;
+  lobbyRef().update({
+    state: view,
+    log: S.log.slice(-LOG_MAX),
   });
+  renderAll();
+}
+
+function leaveLobby() {
+  S.cleanup.forEach(fn => { try { fn(); } catch (_) {} });
+  S.cleanup = [];
+  location.reload();
 }
 
 // ---------- HOST ----------
@@ -74,57 +103,60 @@ async function createLobby() {
   const sb = Math.max(0, parseInt($("smallBlind").value, 10) || 5);
   const bb = Math.max(sb, parseInt($("bigBlind").value, 10) || 10);
 
-  setStatus("Connecting…");
-  try {
-    const code = "POKER-" + rid(5);
-    S.peer = await initPeer(code);
-  } catch (e) {
-    setStatus("Couldn't connect. Try again. " + (e.message || ""), true);
-    return;
-  }
+  setStatus("Creating lobby\u2026");
+
   S.role = "host";
-  S.myId = S.peer.id;
-  S.lobbyCode = S.peer.id;
+  S.myId = getPlayerId();
   S.myName = name;
+  S.lobbyCode = rid(5);
 
   S.game = newGame({ startStack, sb, bb });
   addPlayer(S.game, S.myId, name);
 
-  S.peer.on("connection", (conn) => {
-    conn.on("open", () => {
-      S.clientConns[conn.peer] = conn;
-      conn.on("data", (msg) => handleHostMessage(conn, msg));
-      conn.on("close", () => {
-        delete S.clientConns[conn.peer];
-        markDisconnected(S.game, conn.peer, true);
-        broadcastState();
-      });
-      conn.on("error", () => {
-        delete S.clientConns[conn.peer];
-        markDisconnected(S.game, conn.peer, true);
-        broadcastState();
-      });
-    });
+  const ref = lobbyRef();
+
+  // Write initial lobby
+  await ref.set({
+    config: { startStack, sb, bb, hostId: S.myId },
+    state: viewFromGame(S.game),
+    log: [],
   });
 
-  addLog(`Lobby created. Code: ${displayCode(S.lobbyCode)}`);
+  // Presence
+  const presRef = ref.child("presence/" + S.myId);
+  await presRef.set(true);
+  presRef.onDisconnect().remove();
+  S.cleanup.push(() => presRef.remove());
+
+  // Detect client disconnects
+  ref.child("presence").on("child_removed", (snap) => {
+    const pid = snap.key;
+    if (pid !== S.myId && S.game.players[pid]) {
+      markDisconnected(S.game, pid, true);
+      broadcastState();
+    }
+  });
+  S.cleanup.push(() => ref.child("presence").off());
+
+  // Listen for actions from clients
+  const actRef = ref.child("actions");
+  actRef.on("child_added", (snap) => {
+    const msg = snap.val();
+    snap.ref.remove();
+    if (msg) handleHostMessage(msg);
+  });
+  S.cleanup.push(() => actRef.off());
+
+  addLog(`Lobby created. Code: ${S.lobbyCode}`);
   enterGame();
-  renderAll();
+  broadcastState();
 }
 
-function displayCode(peerId) {
-  // Strip "POKER-" prefix for short display
-  return peerId.startsWith("POKER-") ? peerId.slice(6) : peerId;
-}
-function codeToPeerId(code) {
-  const c = (code || "").trim().toUpperCase();
-  if (!c) return "";
-  return c.startsWith("POKER-") ? c : "POKER-" + c;
-}
-
-function handleHostMessage(conn, msg) {
+function handleHostMessage(msg) {
   if (!msg || !msg.type) return;
-  const playerId = conn.peer;
+  const playerId = msg.playerId;
+  if (!playerId) return;
+
   switch (msg.type) {
     case "join": {
       const pname = String(msg.name || "Guest").slice(0, 20);
@@ -140,7 +172,6 @@ function handleHostMessage(conn, msg) {
       break;
     }
     case "action": {
-      // { kind: "check"|"call"|"fold"|"raise", amount? }
       if (playerId !== S.game.turn) return;
       applyAction(S.game, playerId, msg.kind, msg.amount);
       broadcastState();
@@ -149,60 +180,71 @@ function handleHostMessage(conn, msg) {
   }
 }
 
-function broadcastState() {
-  const view = viewFromGame(S.game);
-  S.view = view;
-  for (const id in S.clientConns) {
-    try { S.clientConns[id].send({ type: "state", view }); } catch (_) {}
-  }
-  renderAll();
-}
-
 // ---------- CLIENT ----------
 async function joinLobby() {
   const name = ($("playerName").value || "").trim();
   if (!name) return setStatus("Enter your name first.", true);
-  const raw = $("joinCode").value || "";
-  const hostId = codeToPeerId(raw);
-  if (!hostId) return setStatus("Enter a lobby code.", true);
+  const code = ($("joinCode").value || "").trim().toUpperCase();
+  if (!code) return setStatus("Enter a lobby code.", true);
 
   saveName(name);
-  setStatus("Connecting…");
-  try {
-    S.peer = await initPeer();
-  } catch (e) {
-    setStatus("Couldn't connect. " + (e.message || ""), true);
+  setStatus("Joining\u2026");
+
+  // Check lobby exists
+  const snap = await db.ref("lobbies/" + code + "/config").once("value");
+  if (!snap.exists()) {
+    setStatus("Lobby not found.", true);
     return;
   }
+
   S.role = "client";
-  S.myId = S.peer.id;
+  S.myId = getPlayerId();
   S.myName = name;
-  S.lobbyCode = hostId;
+  S.lobbyCode = code;
 
-  const conn = S.peer.connect(hostId, { reliable: true });
-  S.hostConn = conn;
+  const ref = lobbyRef();
 
-  const opened = new Promise((res, rej) => {
-    const to = setTimeout(() => rej(new Error("Couldn't reach host")), 10000);
-    conn.on("open", () => { clearTimeout(to); res(); });
-    conn.on("error", (e) => { clearTimeout(to); rej(e); });
+  // Presence
+  const presRef = ref.child("presence/" + S.myId);
+  await presRef.set(true);
+  presRef.onDisconnect().remove();
+  S.cleanup.push(() => presRef.remove());
+
+  // Re-establish presence on reconnect
+  db.ref(".info/connected").on("value", (snap) => {
+    if (snap.val() === true) {
+      presRef.set(true);
+      presRef.onDisconnect().remove();
+    }
   });
-  try {
-    await opened;
-  } catch (e) {
-    setStatus("Join failed: " + (e.message || "timeout"), true);
-    try { S.peer.destroy(); } catch (_) {}
-    return;
-  }
+  S.cleanup.push(() => db.ref(".info/connected").off());
 
-  conn.send({ type: "join", name });
-  conn.on("data", (msg) => {
-    if (msg && msg.type === "state") {
-      S.view = msg.view;
+  // Send join action
+  await ref.child("actions").push({
+    type: "join",
+    playerId: S.myId,
+    name,
+  });
+
+  // Listen for state updates
+  ref.child("state").on("value", (snap) => {
+    const state = snap.val();
+    if (state) {
+      S.view = state;
       renderAll();
     }
   });
-  conn.on("close", () => { setStatus("Disconnected from host.", true); });
+  S.cleanup.push(() => ref.child("state").off());
+
+  // Listen for log updates
+  ref.child("log").on("value", (snap) => {
+    const log = snap.val();
+    if (Array.isArray(log)) {
+      S.log = log;
+      renderLog();
+    }
+  });
+  S.cleanup.push(() => ref.child("log").off());
 
   enterGame();
 }
@@ -211,8 +253,13 @@ function sendAction(kind, amount) {
   if (S.role === "host") {
     applyAction(S.game, S.myId, kind, amount);
     broadcastState();
-  } else if (S.hostConn && S.hostConn.open) {
-    S.hostConn.send({ type: "action", kind, amount });
+  } else {
+    lobbyRef().child("actions").push({
+      type: "action",
+      playerId: S.myId,
+      kind,
+      amount: amount != null ? amount : null,
+    });
   }
 }
 
@@ -273,12 +320,12 @@ function startHand(g) {
   g.pot = sbPaid + bbPaid;
   g.currentBet = g.bb;
   g.minRaise = g.bb;
-  g.lastAggressor = g.order[bbIdx]; // preflop closes when action returns to BB and is matched
+  g.lastAggressor = g.order[bbIdx];
   const firstToAct = seatedIdxs.length === 2 ? g.order[g.dealerIdx] : g.order[nextSeatIdx(g, bbIdx)];
   g.turn = firstToAct;
   g.street = "preflop";
   g.round = "betting";
-  addLog(`New hand #${"" /* simple */}. Dealer: ${g.players[g.order[g.dealerIdx]].name}. Blinds ${g.sb}/${g.bb}. Deal hole cards.`);
+  addLog(`New hand. Dealer: ${g.players[g.order[g.dealerIdx]].name}. Blinds ${g.sb}/${g.bb}. Deal hole cards.`);
   return true;
 }
 
@@ -293,15 +340,12 @@ function dealNextStreet(g) {
 }
 
 function startBettingRound(g) {
-  // Reset per-street betting state
   for (const id of g.order) { g.players[id].bet = 0; g.players[id]._acted = false; }
   g.currentBet = 0;
   g.minRaise = g.bb;
   g.lastAggressor = null;
-  // First to act post-flop: first non-folded, non-all-in player left of dealer
   const firstIdx = nextSeatIdx(g, g.dealerIdx);
   const firstId = g.order[firstIdx];
-  // If everyone left can't act (all-in), skip straight to next street/decide
   const liveCanAct = g.order.filter(i => !g.players[i].folded && !g.players[i].allIn);
   if (liveCanAct.length < 2) {
     if (g.street === "river") { g.round = "decide"; g.turn = null; }
@@ -324,7 +368,7 @@ function nextSeatIdx(g, fromIdx) {
     const i = (fromIdx + step) % n;
     const p = g.players[g.order[i]];
     if (!p.folded && !p.allIn && p.stack > 0 && !p.disconnected) return i;
-    if (!p.folded && !p.allIn && p.stack >= 0) return i; // fallback
+    if (!p.folded && !p.allIn && p.stack >= 0) return i;
   }
   return fromIdx;
 }
@@ -361,7 +405,6 @@ function applyAction(g, id, kind, amount) {
     return;
   }
 
-  // End conditions
   const active = g.order.filter(i => !g.players[i].folded);
   if (active.length === 1) {
     const winner = g.players[active[0]];
@@ -372,10 +415,8 @@ function applyAction(g, id, kind, amount) {
     return;
   }
 
-  // Track that this player has acted this street (for round-close detection)
   g.players[id]._acted = true;
 
-  // Advance turn
   const idx = g.order.indexOf(id);
   const nextIdx = nextSeatIdx(g, idx);
   const nextId = g.order[nextIdx];
@@ -384,15 +425,12 @@ function applyAction(g, id, kind, amount) {
   const allMatched = liveCanAct.every(i => g.players[i].bet === g.currentBet);
   const allActed = liveCanAct.every(i => g.players[i]._acted);
 
-  // No one left who can act → skip remaining streets, host awards
   if (liveCanAct.length <= 1 && active.length >= 2) {
     addLog("No further action possible. Reveal remaining cards then award.");
-    closeStreet(g, /* skipToShowdown */ true);
+    closeStreet(g, true);
     return;
   }
 
-  // Round closes when: action returns to last aggressor (preflop: BB) and all matched,
-  // OR (no aggressor yet — postflop) everyone live has acted and all matched.
   const returnsToAggressor = g.lastAggressor && nextId === g.lastAggressor;
   const closes = (returnsToAggressor && allMatched) || (g.lastAggressor === null && allActed && allMatched);
 
@@ -404,12 +442,11 @@ function applyAction(g, id, kind, amount) {
 }
 
 function closeStreet(g, skipToShowdown) {
-  // Move bets into pot already happened on each action; just clear per-street markers
   for (const id of g.order) { g.players[id]._acted = false; }
   if (skipToShowdown || g.street === "river") {
     g.round = "decide";
     g.turn = null;
-    addLog(g.street === "river" ? "River betting complete. Showdown — host awards pot." : "Reveal remaining cards. Host awards pot.");
+    addLog(g.street === "river" ? "River betting complete. Showdown \u2014 host awards pot." : "Reveal remaining cards. Host awards pot.");
     return;
   }
   g.round = "wait_deal";
@@ -456,31 +493,27 @@ function viewFromGame(g) {
 // ---------- UI ----------
 function enterGame() {
   show("game");
-  $("lobbyCode").textContent = displayCode(S.lobbyCode);
+  $("lobbyCode").textContent = S.lobbyCode;
   $("copyBtn").onclick = () => {
     const url = new URL(location.href);
-    url.searchParams.set("join", displayCode(S.lobbyCode));
+    url.searchParams.set("join", S.lobbyCode);
     navigator.clipboard?.writeText(url.toString());
     setStatus("Invite link copied.");
   };
-  $("leaveBtn").onclick = () => location.reload();
+  $("leaveBtn").onclick = leaveLobby;
 
   if (S.role === "host") {
     $("hostControls").classList.remove("hidden");
     $("startHandBtn").onclick = () => { if (startHand(S.game)) broadcastState(); };
     $("nextRoundBtn").onclick = () => {
-      // Host: deal next street (flop/turn/river) once betting closed,
-      // or jump to showdown after river.
       if (S.game.round === "wait_deal") {
         if (dealNextStreet(S.game)) broadcastState();
       } else if (S.game.round === "betting") {
-        // Force-close current betting round
         closeStreet(S.game, false);
         broadcastState();
       }
     };
     $("resetHandBtn").onclick = () => {
-      // Cancel hand: return bets to stacks, clear pot
       for (const id of S.game.order) {
         const p = S.game.players[id];
         p.stack += p.bet; p.bet = 0; p.folded = false; p.allIn = false;
@@ -506,14 +539,13 @@ function renderAll() {
   if (!S.view) return;
   const v = S.view;
   $("potAmount").textContent = v.pot;
-  $("lobbyCode").textContent = displayCode(S.lobbyCode);
+  $("lobbyCode").textContent = S.lobbyCode;
 
-  // Update host action button labels based on round/street
   if (S.role === "host") {
     const startBtn = $("startHandBtn"), nextBtn = $("nextRoundBtn");
     if (v.round === "idle") {
       startBtn.textContent = "Deal new hand"; startBtn.disabled = false;
-      nextBtn.textContent = "—"; nextBtn.disabled = true;
+      nextBtn.textContent = "\u2014"; nextBtn.disabled = true;
     } else if (v.round === "betting") {
       startBtn.textContent = "Deal new hand"; startBtn.disabled = true;
       nextBtn.textContent = "Force end betting"; nextBtn.disabled = false;
@@ -523,11 +555,10 @@ function renderAll() {
       nextBtn.textContent = "Deal " + next; nextBtn.disabled = false;
     } else if (v.round === "decide") {
       startBtn.textContent = "Deal new hand"; startBtn.disabled = true;
-      nextBtn.textContent = "—"; nextBtn.disabled = true;
+      nextBtn.textContent = "\u2014"; nextBtn.disabled = true;
     }
   }
 
-  // Players
   const pe = $("players");
   pe.innerHTML = "";
   for (const id of v.order) {
@@ -553,7 +584,6 @@ function renderAll() {
     pe.appendChild(el);
   }
 
-  // Your controls
   const me = v.players[S.myId];
   const myTurn = me && v.turn === S.myId && v.round === "betting" && !me.folded && !me.allIn;
   $("youControls").classList.toggle("hidden", !myTurn);
@@ -582,9 +612,7 @@ function renderAll() {
     $("betSlider").classList.add("hidden");
   }
 
-  // Host winner panel
   if (S.role === "host") {
-    const showWinner = v.round === "decide" || v.round === "betting";
     $("hostControls").classList.remove("hidden");
     const panel = $("winnerPanel");
     panel.classList.toggle("hidden", !(v.round === "decide"));
@@ -610,21 +638,19 @@ function renderAll() {
     };
     wb.appendChild(awardBtn);
     $("splitBtn").onclick = () => {
-      const picks = eligible;
-      awardPot(S.game, picks);
+      awardPot(S.game, eligible);
       broadcastState();
     };
   }
 
-  // Status line
   if (v.round === "idle") setStatus("Waiting for host to deal a new hand.");
   else if (v.round === "wait_deal") {
     const next = STREETS[STREETS.indexOf(v.street) + 1];
     setStatus(`${cap(v.street)} betting done. Host: deal the ${next}.`);
   }
-  else if (v.round === "decide") setStatus("Showdown — host awards the pot.");
-  else if (myTurn) setStatus(`${cap(v.street)} — your move.`);
-  else if (v.turn) setStatus(`${cap(v.street)} — ${v.players[v.turn].name}'s turn.`);
+  else if (v.round === "decide") setStatus("Showdown \u2014 host awards the pot.");
+  else if (myTurn) setStatus(`${cap(v.street)} \u2014 your move.`);
+  else if (v.turn && v.players[v.turn]) setStatus(`${cap(v.street)} \u2014 ${v.players[v.turn].name}'s turn.`);
   else setStatus("");
 }
 
@@ -640,7 +666,6 @@ window.addEventListener("DOMContentLoaded", () => {
   $("createBtn").onclick = createLobby;
   $("joinBtn").onclick = joinLobby;
 
-  // Auto-fill join code from URL
   const params = new URLSearchParams(location.search);
   const j = params.get("join");
   if (j) {
